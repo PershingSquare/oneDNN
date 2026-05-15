@@ -229,6 +229,14 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
                 if (problem.Ta_ext.bits() <= 8) min_wg_n = 2;
                 break;
             case compute::gpu_arch_t::xe_hpc: max_n_unroll = 32; break;
+            case compute::gpu_arch_t::xe2: {
+                m_unroll = 32;
+                n_unroll = 32;
+                max_n_unroll = 32;
+                max_wg_n = 2;
+                min_wg_n = 1;
+                break;
+            }
             default:
                 m_unroll = sg_size_ / problem.Ta_ext;
                 max_n_unroll
