@@ -18,6 +18,7 @@
 
 #if DNNL_EXPERIMENTAL_GROUPED_MEMORY
 
+#include "common/memory_tracking.hpp"
 #include "gemmstone/microkernel/shim.hpp"
 #include "gemmstone/microkernel_selector.hpp"
 #include "gemmstone/strategy_parser.hpp"
@@ -355,19 +356,25 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     ngroups_ = src_grouped.group_count;
     is_gemv_ = M() < ngroups_;
 
-    // Token-centric dispatch: when avg tokens-per-expert is large enough
-    // that current expert-major dispatch wastes most WGs on early-exit
-    // (empty/small experts), switch to dispatching over flat tokens and
-    // letting the kernel route via find_sparse_batch.
+    // Token-centric dispatch (Phase 1.6): replaces expert-major dispatch
+    // for MoE shapes with many experts. A precompute kernel writes
+    // tile_starts[ngroups+1] once per call; the main GEMM dispatches
+    // gws[2] = ceil(M/wg_tile_n) + ngroups upper-bound tile-WGs.
     //
-    // NOTE (2026-05): Phase-1 naive m_all dispatch was experimentally a net
-    // SLOWDOWN on production MoE shapes due to find_sparse_batch overhead
-    // dominating the per-WG work. Auto-enable is disabled until the
-    // per-expert tile prefix-sum optimization is implemented (Phase 1.5).
-    // Available behind GRPGEMM_TOKEN_CENTRIC=1 for experimentation.
-    use_token_centric_ = !is_gemv_
-            && gpu_utils::dev_getenv("GRPGEMM_TOKEN_CENTRIC", 0) == 1
-            && ngroups_ > 32;
+    // Heuristic: enable when ngroups > 32 AND M/ngroups >= 8 (i.e., the
+    // current expert-major dispatch wastes >>50% of WGs on early-exit).
+    // Override via GRPGEMM_TOKEN_CENTRIC: 0=off, 1=on, default=auto.
+    {
+        int env_override = gpu_utils::dev_getenv("GRPGEMM_TOKEN_CENTRIC", -1);
+        if (env_override == 1) {
+            use_token_centric_ = !is_gemv_;
+        } else if (env_override == 0) {
+            use_token_centric_ = false;
+        } else {
+            use_token_centric_ = !is_gemv_ && ngroups_ > 32
+                    && M() >= ngroups_ * 8;
+        }
+    }
 
     // only supported dt for now
     VDISPATCH_MATMUL(utils::one_of(src_dt, f32, f16, bf16, u8, s8, s4, u4,
@@ -552,14 +559,32 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     kernel_ctx_.define_int("WITH_TILE_INDEX", use_token_centric_);
     kernel_ctx_.define_int("WITH_SLM", gemm_.getSetting("slm_size") > 0);
     kernel_ctx_.define_int("NUM_GROUPS", ngroups_);
+    // WG_TILE_N is the M-direction tile size used by the main GEMM.
+    // Needed by the precompute kernel which doesn't include gemm_grouped.h.
+    kernel_ctx_.define_int("WG_TILE_N", gemm_.getSetting("wg_tile_n"));
     kernel_ctx_.add_option("-cl-std=CL3.0");
+
+    // Reserve scratchpad for tile_starts buffer when WITH_TILE_INDEX is on.
+    // Layout: int32[ngroups_ + 1]; index ngroups_ holds total_tiles count.
+    if (use_token_centric_) {
+        auto scratchpad = scratchpad_registry().registrar();
+        scratchpad.book(memory_tracking::names::key_matmul_pack_space,
+                ngroups_ + 1, sizeof(int32_t), OCL_BUFFER_ALIGNMENT);
+    }
 
     return status::success;
 }
 
 status_t grouped_micro_gemm_t::init(impl::engine_t *engine) {
-    return create_kernel(
-            engine, &kernel_, "grouped_micro_gemm", pd()->kernel_ctx_);
+    // Create both kernels - main GEMM and the precompute kernel for
+    // tile_starts. Precompute is only dispatched when use_token_centric_.
+    std::vector<compute::kernel_t> kernels;
+    static const std::vector<const char *> kernel_names
+            = {"grouped_micro_gemm", "grouped_compute_tile_starts"};
+    CHECK(create_kernels(engine, &kernels, kernel_names, pd()->kernel_ctx_));
+    kernel_ = kernels[0];
+    precompute_kernel_ = kernels[1];
+    return status::success;
 }
 
 status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
@@ -635,6 +660,34 @@ status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
     arg_list.append(k);
 
     arg_list.append(bias_data);
+
+    // For WITH_TILE_INDEX mode: launch precompute kernel for tile_starts[]
+    // before the main GEMM. The scratchpad buffer holds [NUM_GROUPS+1] int32.
+    // When token-centric is off, pass src_offsets as a dummy (kernel won't
+    // dereference tile_starts in that case).
+    std::unique_ptr<memory_storage_t> tile_starts_storage;
+    if (pd()->use_token_centric_) {
+        tile_starts_storage
+                = ctx.get_scratchpad_grantor().get_memory_storage(
+                        memory_tracking::names::key_matmul_pack_space);
+
+        compute::kernel_arg_list_t pre_args;
+        pre_args.append(src_offsets);
+        pre_args.append(*tile_starts_storage);
+
+        // Single WG of 1 work-item (kernel uses sequential scan, ngroups~128).
+        compute::range_t pre_lws = compute::range_t {1, 1, 1};
+        compute::range_t pre_gws = compute::range_t {(size_t)pd()->sg_size_, 1, 1};
+        // Subgroup-size attribute requires gws[0] >= sg_size; kernel itself
+        // only uses WI 0.
+        CHECK(parallel_for(ctx, compute::nd_range_t(pre_gws, pre_lws),
+                precompute_kernel_, pre_args));
+        arg_list.append(*tile_starts_storage);
+    } else {
+        // Pass src_offsets as a placeholder; main kernel won't read it
+        // unless WITH_TILE_INDEX (which is gated on use_token_centric_).
+        arg_list.append(src_offsets);
+    }
 
     size_t sg_per_wg_m = pd()->gemm_.getSetting("sg_per_wg_m");
     size_t sg_per_wg_n = pd()->gemm_.getSetting("sg_per_wg_n");

@@ -23,6 +23,37 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+// Precompute kernel for token-centric dispatch (WITH_TILE_INDEX mode).
+// Runs once per grouped GEMM call, before the main kernel.
+// Input:  src_offsets[NUM_GROUPS]  (cumulative end-of-expert positions)
+// Output: tile_starts[NUM_GROUPS + 1]
+//   tile_starts[i]         = sum over j < i of ceil(expert_tokens[j] / WG_TILE_N)
+//   tile_starts[NUM_GROUPS] = total active tiles
+//
+// Launched as a single workgroup of NUM_GROUPS work-items, one per expert.
+// Uses subgroup-cooperative scan to compute the prefix sum in O(log NUM_GROUPS).
+//
+// WG_TILE_N is passed as a -D macro (the GEMM's wg_tile_n).
+__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+kernel void grouped_compute_tile_starts(const global int *src_offsets,
+        global int *tile_starts) {
+    // Single WI, sequential scan. NUM_GROUPS is small (~128), src_offsets
+    // is a tiny global read that L1 caches. Total: ~128 cycles, runs once
+    // per grouped GEMM call.
+    if (get_global_id(0) != 0) return;
+
+    int sum = 0;
+    int prev = 0;
+    for (int i = 0; i < NUM_GROUPS; i++) {
+        tile_starts[i] = sum;
+        int curr = src_offsets[i];
+        int tokens = curr - prev;
+        sum += (tokens + WG_TILE_N - 1) / WG_TILE_N;
+        prev = curr;
+    }
+    tile_starts[NUM_GROUPS] = sum; // total active tiles
+}
+
 #if WITH_BIAS
 #define bias_br ugemm_grouped_sg_tile_m
 #define bias_bc 1
@@ -222,7 +253,8 @@ grouped_micro_gemm(const global SRC_DATA_T *src, long ldsrc,
         const global SRC_ZP_DATA_T *src_attr_zp, const long ldsrcq,
         const global WEI_SCALES_DATA_T *wei_attr_scales,
         const global WEI_ZP_DATA_T *wei_attr_zp, const long ldweiq,
-        const long n, const long k, const global BIA_DATA_T *bias) {
+        const long n, const long k, const global BIA_DATA_T *bias,
+        const global int *tile_starts) {
 #if WITH_SLM
     local char slm[MAX(ugemm_grouped_slm_size, slm_sparse_total_size)];
 #else
@@ -246,46 +278,24 @@ grouped_micro_gemm(const global SRC_DATA_T *src, long ldsrc,
     off_t src_offset;
 
 #if WITH_TILE_INDEX
-    // Token-centric per-expert tile dispatch.
-    // gws[2] = upper-bound total_tiles = ceil(total_M/wg_tile_n) + NUM_GROUPS.
-    // Each WG: (1) cooperatively builds tile_starts[] in SLM via single-WI
-    // sequential scan; (2) early-exits if its tile_idx >= actual total_tiles;
-    // (3) binary searches tile_starts to find owning expert; (4) computes
-    // wg_j0 within expert.
-    //
-    // SLM layout: slm_tile_starts[NUM_GROUPS+1] of int. slm[NUM_GROUPS]
-    // holds the actual total_tiles count.
-    local int slm_tile_starts_arr[NUM_GROUPS + 1];
-
-    // Single WI does the prefix-sum scan. NUM_GROUPS is small (~128).
-    if (get_local_linear_id() == 0) {
-        int sum = 0;
-        slm_tile_starts_arr[0] = 0;
-        for (int i = 0; i < NUM_GROUPS; i++) {
-            int prev = (i == 0) ? 0 : src_offsets[i - 1];
-            int curr = src_offsets[i];
-            int tokens = curr - prev;
-            sum += (tokens + ugemm_grouped_wg_tile_n - 1)
-                    / ugemm_grouped_wg_tile_n;
-            slm_tile_starts_arr[i + 1] = sum;
-        }
-    }
-    work_group_barrier(CLK_LOCAL_MEM_FENCE);
-
-    int total_tiles = slm_tile_starts_arr[NUM_GROUPS];
+    // Token-centric per-expert tile dispatch (Phase 1.6).
+    // tile_starts[] is precomputed by grouped_compute_tile_starts kernel
+    // before this kernel runs. Reads are L1-cached (small ~128 ints).
+    // gws[2] = total_tiles upper bound = ceil(m_all/wg_tile_n) + NUM_GROUPS.
+    int total_tiles = tile_starts[NUM_GROUPS];
     off_t tile_idx = get_group_id(2);
     if (tile_idx >= total_tiles) return; // upper-bound dispatch slack
 
     // Binary search: find expert e such that
-    //   slm_tile_starts_arr[e] <= tile_idx < slm_tile_starts_arr[e+1]
+    //   tile_starts[e] <= tile_idx < tile_starts[e+1]
     int lo = 0, hi = NUM_GROUPS;
     while (lo + 1 < hi) {
         int mid = (lo + hi) >> 1;
-        if (slm_tile_starts_arr[mid] <= tile_idx) lo = mid;
+        if (tile_starts[mid] <= tile_idx) lo = mid;
         else hi = mid;
     }
     batch = lo;
-    int tile_within_expert = (int)tile_idx - slm_tile_starts_arr[batch];
+    int tile_within_expert = (int)tile_idx - tile_starts[batch];
     int prev = (batch == 0) ? 0 : src_offsets[batch - 1];
     src_offset = prev;
     m = src_offsets[batch] - prev;

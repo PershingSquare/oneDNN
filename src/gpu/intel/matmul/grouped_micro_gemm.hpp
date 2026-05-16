@@ -94,6 +94,7 @@ struct grouped_micro_gemm_t : public primitive_t {
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
     compute::kernel_t kernel_;
+    compute::kernel_t precompute_kernel_;
 };
 
 } // namespace matmul
