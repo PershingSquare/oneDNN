@@ -192,8 +192,28 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
             std::getline(ss >> std::ws, strategyString);
             parseStrategy(strategyString, hw, problem, strat);
             adjustStrategy(hw, problem, strat);
+        } else if (dev_info->gpu_arch() == compute::gpu_arch_t::xe2
+                && !is_gemv_
+                && (float(M()) / ngroups_) >= 64.0f) {
+            auto product = ngen::npack::decodeHWIPVersion(hw_info.gmdid);
+            auto hw = getCore(product.family);
+            auto stepping = hw_info.gmdid & 0xFF;
+            strat = GEMMStrategy(hw, stepping);
+            strat.unroll[0] = 32;
+            strat.unroll[1] = 32;
+            std::string body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rb wg 4x1 sys xaf k1 grf256 vav di sr pk32 np";
+            parseStrategy(body, hw, problem, strat);
+            adjustStrategy(hw, problem, strat);
         }
         strategyGRFs_ = strat.GRFs;
+        if (gpu_utils::dev_getenv("GRPGEMM_DUMP_STRATEGY", 0)) {
+            auto product = ngen::npack::decodeHWIPVersion(hw_info.gmdid);
+            auto hw = getCore(product.family);
+            printf("GRPGEMM_STRATEGY_DUMP: unroll=%dx%d M=%d N=%d K=%d ngroups=%d str=\"%s\"\n",
+                strat.unroll[0], strat.unroll[1],
+                (int)sizes.m, (int)sizes.n, (int)sizes.k, (int)ngroups_,
+                unparseStrategy(hw, problem, strat).c_str());
+        }
     };
 
     try {
