@@ -543,11 +543,13 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     def_data_type(kernel_ctx_, bia_dt, "BIA");
     kernel_ctx_.define_int("WITH_BIAS", with_bias());
     kernel_ctx_.define_int("K_PARALLEL_LOCAL", is_gemv_);
-    // WITH_SPARSE_GROUPS enables token-centric dispatch (gws[2] iterates
-    // over m_all). Used by GEMV mode (M() < ngroups_) and by token-centric
-    // dispatch for non-GEMV shapes with many experts.
-    kernel_ctx_.define_int(
-            "WITH_SPARSE_GROUPS", is_gemv_ || use_token_centric_);
+    // WITH_SPARSE_GROUPS: token-flat dispatch (gws[2]=m_all), used by GEMV.
+    // WITH_TILE_INDEX: per-expert tile dispatch (gws[2]=total_tiles upper
+    //   bound), used by token-centric mode for non-GEMV. Each WG computes
+    //   tile_starts[] in SLM via single-WI prefix sum, then binary searches
+    //   to find owning expert.
+    kernel_ctx_.define_int("WITH_SPARSE_GROUPS", is_gemv_);
+    kernel_ctx_.define_int("WITH_TILE_INDEX", use_token_centric_);
     kernel_ctx_.define_int("WITH_SLM", gemm_.getSetting("slm_size") > 0);
     kernel_ctx_.define_int("NUM_GROUPS", ngroups_);
     kernel_ctx_.add_option("-cl-std=CL3.0");
@@ -657,12 +659,25 @@ status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
     compute::range_t gws = lws;
     // Swap wg_tile_[mn]_ for col-major vs row-major representations
     gws[0] *= utils::div_up(n, wg_tile_m);
-    // In token-centric mode, the WG handles a full wg_tile_n region per
-    // (expert, tile) - the M-direction tiles within an expert are walked
-    // via flat_token in gws[2] instead of via gws[1].
-    const bool token_centric_dispatch = pd()->is_gemv_ || pd()->use_token_centric_;
-    gws[1] *= token_centric_dispatch ? 1 : utils::div_up(m_dispatch, wg_tile_n);
-    gws[2] *= token_centric_dispatch ? m_all : pd()->ngroups_;
+    // Dispatch shape:
+    //   GEMV: gws[2]=m_all, one WG per flat_token
+    //   token-centric: gws[2]=ceil(m_all/wg_tile_n)+ngroups (upper bound),
+    //     gws[1]=1, each WG owns one (expert, tile_within_expert)
+    //   default: gws[2]=ngroups, gws[1]=ceil(m_dispatch/wg_tile_n)
+    if (pd()->is_gemv_) {
+        gws[1] *= 1;
+        gws[2] *= m_all;
+    } else if (pd()->use_token_centric_) {
+        // Upper bound: each expert contributes at most ceil(t/wg_tile_n)
+        // tiles, total <= m_all/wg_tile_n + ngroups (boundary slack).
+        const dim_t total_tiles_upper
+                = utils::div_up(m_all, wg_tile_n) + pd()->ngroups_;
+        gws[1] *= 1;
+        gws[2] *= total_tiles_upper;
+    } else {
+        gws[1] *= utils::div_up(m_dispatch, wg_tile_n);
+        gws[2] *= pd()->ngroups_;
+    }
 
     return parallel_for(ctx, compute::nd_range_t(gws, lws), kernel_, arg_list);
 }

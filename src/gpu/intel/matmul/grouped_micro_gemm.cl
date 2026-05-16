@@ -245,7 +245,52 @@ grouped_micro_gemm(const global SRC_DATA_T *src, long ldsrc,
     off_t m;
     off_t src_offset;
 
-#if WITH_SPARSE_GROUPS
+#if WITH_TILE_INDEX
+    // Token-centric per-expert tile dispatch.
+    // gws[2] = upper-bound total_tiles = ceil(total_M/wg_tile_n) + NUM_GROUPS.
+    // Each WG: (1) cooperatively builds tile_starts[] in SLM via single-WI
+    // sequential scan; (2) early-exits if its tile_idx >= actual total_tiles;
+    // (3) binary searches tile_starts to find owning expert; (4) computes
+    // wg_j0 within expert.
+    //
+    // SLM layout: slm_tile_starts[NUM_GROUPS+1] of int. slm[NUM_GROUPS]
+    // holds the actual total_tiles count.
+    local int slm_tile_starts_arr[NUM_GROUPS + 1];
+
+    // Single WI does the prefix-sum scan. NUM_GROUPS is small (~128).
+    if (get_local_linear_id() == 0) {
+        int sum = 0;
+        slm_tile_starts_arr[0] = 0;
+        for (int i = 0; i < NUM_GROUPS; i++) {
+            int prev = (i == 0) ? 0 : src_offsets[i - 1];
+            int curr = src_offsets[i];
+            int tokens = curr - prev;
+            sum += (tokens + ugemm_grouped_wg_tile_n - 1)
+                    / ugemm_grouped_wg_tile_n;
+            slm_tile_starts_arr[i + 1] = sum;
+        }
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+    int total_tiles = slm_tile_starts_arr[NUM_GROUPS];
+    off_t tile_idx = get_group_id(2);
+    if (tile_idx >= total_tiles) return; // upper-bound dispatch slack
+
+    // Binary search: find expert e such that
+    //   slm_tile_starts_arr[e] <= tile_idx < slm_tile_starts_arr[e+1]
+    int lo = 0, hi = NUM_GROUPS;
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) >> 1;
+        if (slm_tile_starts_arr[mid] <= tile_idx) lo = mid;
+        else hi = mid;
+    }
+    batch = lo;
+    int tile_within_expert = (int)tile_idx - slm_tile_starts_arr[batch];
+    int prev = (batch == 0) ? 0 : src_offsets[batch - 1];
+    src_offset = prev;
+    m = src_offsets[batch] - prev;
+    wg_j0 = (off_t)tile_within_expert * ugemm_grouped_wg_tile_n;
+#elif WITH_SPARSE_GROUPS
     off_t flat_token = get_group_id(2);
     int2 src_range;
     find_sparse_batch(&batch, &src_range, src_offsets, flat_token, slm);
