@@ -201,7 +201,19 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
             strat = GEMMStrategy(hw, stepping);
             strat.unroll[0] = 32;
             strat.unroll[1] = 32;
-            std::string body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rb wg 4x1 sys xaf k1 grf256 vav di sr pk32 np";
+            // Per-shape dispatch tuned via grid sweep on production MoE shapes.
+            // sizes.m = matrix-N. Selects wg_m based on (N, K):
+            //   N<1024, K>1500: wg 8x1   (TP8 GEMM1: small N, large K)
+            //   N>=2500, K>=512: wg 2x1  (TP4 GEMM2: large N, large K)
+            //   else: wg 4x1            (TP4 GEMM1, TP8 GEMM2)
+            std::string body;
+            if (sizes.m < 1024 && sizes.k >= 1500) {
+                body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 8x1 sys xaf k1 grf256 vav di sr pk32 np";
+            } else if (sizes.m >= 2500 && sizes.k >= 512) {
+                body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 2x1 sys xaf k1 grf256 vav di sr pk32 np";
+            } else {
+                body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 4x1 sys xaf k1 grf256 vav di sr pk32 np";
+            }
             parseStrategy(body, hw, problem, strat);
             adjustStrategy(hw, problem, strat);
         }
