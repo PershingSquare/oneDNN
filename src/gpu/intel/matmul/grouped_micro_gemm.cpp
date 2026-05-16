@@ -355,6 +355,20 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     ngroups_ = src_grouped.group_count;
     is_gemv_ = M() < ngroups_;
 
+    // Token-centric dispatch: when avg tokens-per-expert is large enough
+    // that current expert-major dispatch wastes most WGs on early-exit
+    // (empty/small experts), switch to dispatching over flat tokens and
+    // letting the kernel route via find_sparse_batch.
+    //
+    // NOTE (2026-05): Phase-1 naive m_all dispatch was experimentally a net
+    // SLOWDOWN on production MoE shapes due to find_sparse_batch overhead
+    // dominating the per-WG work. Auto-enable is disabled until the
+    // per-expert tile prefix-sum optimization is implemented (Phase 1.5).
+    // Available behind GRPGEMM_TOKEN_CENTRIC=1 for experimentation.
+    use_token_centric_ = !is_gemv_
+            && gpu_utils::dev_getenv("GRPGEMM_TOKEN_CENTRIC", 0) == 1
+            && ngroups_ > 32;
+
     // only supported dt for now
     VDISPATCH_MATMUL(utils::one_of(src_dt, f32, f16, bf16, u8, s8, s4, u4,
                              f8_e5m2, f8_e4m3, e8m0, f4_e2m1, f4_e3m0),
@@ -529,7 +543,11 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     def_data_type(kernel_ctx_, bia_dt, "BIA");
     kernel_ctx_.define_int("WITH_BIAS", with_bias());
     kernel_ctx_.define_int("K_PARALLEL_LOCAL", is_gemv_);
-    kernel_ctx_.define_int("WITH_SPARSE_GROUPS", is_gemv_);
+    // WITH_SPARSE_GROUPS enables token-centric dispatch (gws[2] iterates
+    // over m_all). Used by GEMV mode (M() < ngroups_) and by token-centric
+    // dispatch for non-GEMV shapes with many experts.
+    kernel_ctx_.define_int(
+            "WITH_SPARSE_GROUPS", is_gemv_ || use_token_centric_);
     kernel_ctx_.define_int("WITH_SLM", gemm_.getSetting("slm_size") > 0);
     kernel_ctx_.define_int("NUM_GROUPS", ngroups_);
     kernel_ctx_.add_option("-cl-std=CL3.0");
@@ -639,8 +657,12 @@ status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
     compute::range_t gws = lws;
     // Swap wg_tile_[mn]_ for col-major vs row-major representations
     gws[0] *= utils::div_up(n, wg_tile_m);
-    gws[1] *= utils::div_up(m_dispatch, wg_tile_n);
-    gws[2] *= pd()->is_gemv_ ? m_all : pd()->ngroups_;
+    // In token-centric mode, the WG handles a full wg_tile_n region per
+    // (expert, tile) - the M-direction tiles within an expert are walked
+    // via flat_token in gws[2] instead of via gws[1].
+    const bool token_centric_dispatch = pd()->is_gemv_ || pd()->use_token_centric_;
+    gws[1] *= token_centric_dispatch ? 1 : utils::div_up(m_dispatch, wg_tile_n);
+    gws[2] *= token_centric_dispatch ? m_all : pd()->ngroups_;
 
     return parallel_for(ctx, compute::nd_range_t(gws, lws), kernel_, arg_list);
 }

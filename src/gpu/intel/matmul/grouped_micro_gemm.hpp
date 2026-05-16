@@ -71,6 +71,12 @@ struct grouped_micro_gemm_t : public primitive_t {
         status_t init_microkernels(impl::engine_t *engine);
 
         bool is_gemv_ = false;
+        // Token-centric dispatch (WITH_SPARSE_GROUPS for non-GEMV).
+        // When true, gws[2] iterates over m_all instead of ngroups_,
+        // skipping empty/sparse experts via tile-aligned early-exit in
+        // the kernel. Reduces dispatch overhead on MoE shapes with many
+        // experts and avg-tokens-per-expert >> wg_tile_n.
+        bool use_token_centric_ = false;
         int sg_size_ = 0;
         int strategyGRFs_ = 0;
         dim_t ngroups_ = 0;
