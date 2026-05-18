@@ -140,11 +140,17 @@ protected:
     constexpr SWSBInfoXeHPC(uint16_t all_, bool dummy) : all{all_} {}
 
     static constexpr14 unsigned combinedMode(SWSBInfo info, Opcode op) {
+        if (op == Opcode::dpas) {
+            if (info.parts.src && info.parts.dst) return 1;
+            if (info.parts.src) return 2;
+            if (info.parts.dst) return 3;
+            return 0;
+        }
         auto pipe = info.getPipe();
         if (info.parts.src && info.parts.dst)
             return (pipe == Pipe::F) ? 2 : (pipe == Pipe::I) ? 3 : 1;
         if (info.parts.src) return 2;
-        if (info.parts.dst) return (pipe == Pipe::A || op == Opcode::dpas) ? 3 : 1;
+        if (info.parts.dst) return (pipe == Pipe::A) ? 3 : 1;
         return 0;
     }
 
