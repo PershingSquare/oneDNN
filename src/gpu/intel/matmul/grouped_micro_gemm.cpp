@@ -203,16 +203,64 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
             strat.unroll[0] = 32;
             strat.unroll[1] = 32;
             // Per-shape dispatch tuned via grid sweep on production MoE shapes.
-            // sizes.m = matrix-N. Selects wg_m based on (N, K):
-            //   N<1024, K>1500: wg 8x1   (TP8 GEMM1: small N, large K)
-            //   N>=2500, K>=512: wg 2x1  (TP4 GEMM2: large N, large K)
-            //   else: wg 4x1            (TP4 GEMM1, TP8 GEMM2)
+            // sizes.m = matrix-N (col-major), sizes.k = matrix-K.
+            //
+            // EU-scaled heuristic: the right wg_m depends on whether we have
+            // "enough" WGs to fill the GPU. Larger wg_m amortizes per-WG
+            // overhead but produces fewer total WGs per launch. We pick wg_m
+            // such that total dispatched WGs >= ~3x concurrent_wgs (3 waves
+            // worth) so the scheduler has work to hide tail effects.
+            //
+            // For Xe2: hw_threads(large_grf=true) gives the count of
+            // GRF256-mode threads (4 per EU). With wg_m subgroups of
+            // SUBGROUP_SIZE=16 work-items per WG, concurrent_wgs is
+            // hw_threads / wg_m. So wg_m=8 -> concurrent ~= eu_count/2,
+            // wg_m=4 -> ~= eu_count, wg_m=2 -> ~= 2*eu_count.
+            //
+            // Reference points (BMG B60, 160 EUs, 456 GB/s, ~80 grf256 threads):
+            //   TP8G1 (N=768,  K=2944): wg 8x1  - few N-tiles, large K, plenty of WGs from K-loop
+            //   TP4G1 (N=1536, K=2944): wg 4x1  - balance
+            //   TP4G2 (N=2880, K=768):  wg 2x1  - many N-tiles, large per-WG cost
+            //   TP8G2 (N=2880, K=384):  wg 4x1  - many N-tiles, K too short for wg_m=2 efficiency
+            //
+            // Scaling: a 32-Xe-core variant (256 EUs, 608 GB/s) has 1.6x more
+            // EUs but only 1.33x more BW, so per-EU BW drops 17%. To utilize
+            // the extra EUs, prefer smaller wg_m (more concurrent WGs).
+            // Threshold sizes.m for wg_m=2 selection scales inversely with
+            // eu_count (smaller sizes.m can use wg_m=2 on bigger GPUs).
+            const int eu_count = hw_info.euCount;
+            // Reference: B60 has 160 EUs. Use ratio to scale thresholds.
+            // (eu_ref / eu_count) > 1 means we have FEWER EUs (smaller GPU) -
+            // prefer larger wg_m. < 1 means more EUs - prefer smaller wg_m.
+            const float eu_scale = 160.0f / float(std::max(eu_count, 1));
+
+            // Thresholds scaled by eu_scale (=160/eu_count, B60=1.0):
+            //   small_n_thresh: below this, sizes.m is 'small' -> wg_m=8 OK
+            //   large_n_thresh: above this, sizes.m is 'large' -> wg_m=2
+            // On larger GPUs (smaller eu_scale), thresholds shrink so more
+            // shapes land in the wg_m=2 bucket (more parallel WGs).
+            const float small_n_thresh = 1024.0f * eu_scale; // 1024 @ B60
+            const float large_n_thresh = 2500.0f * eu_scale; // 2500 @ B60
+            // For 'big-enough' GPUs, also use wg_m=2 even at short K, since
+            // we have enough EUs to absorb the extra concurrent WGs without
+            // serialization. eu_count >= 200 (between B60 and 256-EU SKU).
+            const bool big_gpu = eu_count >= 200;
+
             std::string body;
-            if (sizes.m < 1024 && sizes.k >= 1500) {
+            if (sizes.m < small_n_thresh && sizes.k >= 1500) {
+                // Small N + large K: wg 8x1
+                // K-loop fills the latency pipeline; few N-tiles fit GPU.
                 body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 8x1 sys xaf k1 grf256 vav di sr pk32 np";
-            } else if (sizes.m >= 2500 && sizes.k >= 512) {
+            } else if (sizes.m >= large_n_thresh
+                    && (sizes.k >= 512 || big_gpu)) {
+                // Large N: wg 2x1.
+                // - On B60 we require k>=512 (TP4G2) because at short K the
+                //   pipeline tail dominates and wg_m=4 is better (TP8G2).
+                // - On bigger GPUs we use wg_m=2 even at short K because
+                //   more EUs give more concurrent WGs to hide tail effects.
                 body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 2x1 sys xaf k1 grf256 vav di sr pk32 np";
             } else {
+                // Default: wg 4x1 (balanced for medium N or short K on B60)
                 body = "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 4x1 sys xaf k1 grf256 vav di sr pk32 np";
             }
             parseStrategy(body, hw, problem, strat);
