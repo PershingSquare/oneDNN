@@ -596,6 +596,22 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
         match_params.back().selector.precisions[2] = "I";
     }
 
+    // Allow cases with integer acc to reuse strategies with equal size float acc.
+    // Prioritize float acc strategies as they're better optimized.
+    if (acc_type == data_type::s32) {
+        size_t npatterns = match_params.size();
+        std::vector<MatchParams> float_strats;
+        for (size_t i = 0; i < npatterns; ++i) {
+            auto start = match_params[i];
+            if (!std::string("I").compare(start.selector.precisions[2])) {
+                float_strats.push_back(start);
+                float_strats.back().selector.precisions[2] = "S";
+            }
+        }
+        match_params.insert(
+                match_params.begin(), float_strats.begin(), float_strats.end());
+    }
+
     EvaluateParams eval_params;
 
     eval_params.sizes = base.sizes;
