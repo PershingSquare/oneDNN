@@ -42,6 +42,8 @@
 32x4096:4096x6144_nQKV_bs32
 # bs=768 prefill
 768x4096:4096x6144_nQKV_bs768
+# bs=2048 prefill
+2048x4096:4096x6144_nQKV_bs2048
 
 # O projection: M=bs, N=4096, K=4096
 # bs=1..32
@@ -79,6 +81,8 @@
 32x4096:4096x4096_nO_bs32
 # bs=768 prefill
 768x4096:4096x4096_nO_bs768
+# bs=2048 prefill
+2048x4096:4096x4096_nO_bs2048
 
 # GateUp projection: M=bs, N=28672, K=4096
 # bs=1..32
@@ -116,6 +120,8 @@
 32x4096:4096x28672_nGateUp_bs32
 # bs=768 prefill
 768x4096:4096x28672_nGateUp_bs768
+# bs=2048 prefill
+2048x4096:4096x28672_nGateUp_bs2048
 
 # Down projection: M=bs, N=4096, K=14336
 --attr-scales=src:per_ocic:f16:1x14336+wei:per_oc:f16
@@ -155,3 +161,15 @@
 32x14336:14336x4096_nDown_bs32
 # bs=768 prefill
 768x14336:14336x4096_nDown_bs768
+# bs=2048 prefill
+2048x14336:14336x4096_nDown_bs2048
+
+# bs=512 prefill
+--attr-scales=src:per_ocic:f16:1x4096+wei:per_oc:f16
+--attr-zero-points=src:per_ocic:u8:1x4096
+512x4096:4096x6144_nQKV_bs512
+512x4096:4096x4096_nO_bs512
+512x4096:4096x28672_nGateUp_bs512
+--attr-scales=src:per_ocic:f16:1x14336+wei:per_oc:f16
+--attr-zero-points=src:per_ocic:u8:1x14336
+512x14336:14336x4096_nDown_bs512
