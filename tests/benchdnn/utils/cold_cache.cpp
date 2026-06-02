@@ -133,6 +133,17 @@ cold_cache_t::cold_cache_t(
     if (cold_mem_pool_size > cold_args_size)
         n_mem_pool_buffers = div_up(cold_mem_pool_size, cold_args_size);
 
+    // When one set of cold args exceeds the cold pool, the pool heuristic
+    // gives 0 extra buffers and the loop reuses one set, running WARM and
+    // inflating bandwidth past the DRAM peak. Force a minimum rotation whose
+    // aggregate footprint exceeds the pool so the first set is evicted before
+    // reuse; the absolute top limit still bounds memory use.
+    if (n_mem_pool_buffers == 0 && cold_args_size > 0) {
+        const size_t min_rotation_footprint = 2 * cache_size_upper_bound;
+        n_buffers_bottom_limit_ = div_up(min_rotation_footprint, cold_args_size);
+        if (n_buffers_bottom_limit_ < 2) n_buffers_bottom_limit_ = 2;
+    }
+
     n_buffers_ = MIN2(MAX2(n_mem_pool_buffers, n_buffers_bottom_limit_),
             n_buffers_top_limit_);
     override_n_buffers_ = n_mem_pool_buffers > n_buffers_top_limit_;
@@ -150,6 +161,17 @@ cold_cache_t::cold_cache_t(
                 smart_bytes(cold_cache_input_.cold_tlb_size_).c_str());
     }
     if (n_buffers_ <= 0) {
+        // cold_args_size doesn't fit the cold memory pool, so the loop reuses
+        // the single original buffer set and runs WARM: data stays cache
+        // resident across iterations and bandwidth is inflated (can exceed the
+        // DRAM peak). Warn so warm numbers aren't mistaken for cold results.
+        BENCHDNN_PRINT(0,
+                "[COLD_CACHE][WARNING] Cold cache requested but INACTIVE: cold "
+                "args (%s) exceed the cold memory pool (%s). Measurements run "
+                "WARM (cache-resident); bandwidth is NOT representative of "
+                "cold/DRAM traffic.\n",
+                smart_bytes(cold_args_size).c_str(),
+                smart_bytes(cold_mem_pool_size).c_str());
         // No buffers allocation needed, return to avoid scratching `cache_`
         // object. This allows to keep rest logic intact.
         return;
