@@ -21,7 +21,7 @@ GEMMSTONE_NAMESPACE_START
 
 
 // Split A/B matrix between threads.
-void coopSplit(bool isA, int &splitR, int &splitC, int r, int c, int mnFull, CoopSplit stype, const MatrixAddressing &atype, const GEMMStrategy &strategy)
+void coopSplit(bool isA, int &splitR, int &splitC, int r, int c, int mnFull, CoopSplit &stype, const MatrixAddressing &atype, const GEMMStrategy &strategy)
 {
     auto &mn      = isA ? r : c;
     auto &k       = isA ? c : r;
@@ -44,8 +44,15 @@ void coopSplit(bool isA, int &splitR, int &splitC, int r, int c, int mnFull, Coo
             break;
         case CoopSplit::MN:
             ok = (mn % threads == 0);
-            splitMN = mn / threads;
-            splitK = k;
+            if (ok) {
+                splitMN = mn / threads;
+                splitK = k;
+            } else if (k % threads == 0) {
+                stype = CoopSplit::K;
+                splitMN = mn;
+                splitK = k / threads;
+                ok = true;
+            }
             break;
         case CoopSplit::Linear: {
             int elems = r * c;

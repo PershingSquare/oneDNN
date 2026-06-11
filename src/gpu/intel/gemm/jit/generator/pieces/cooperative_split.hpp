@@ -25,7 +25,7 @@
 GEMMSTONE_NAMESPACE_START
 
 // Split A/B matrix between threads.
-void coopSplit(bool isA, int &splitR, int &splitC, int r, int c, int mnFull, CoopSplit stype, const MatrixAddressing &atype, const GEMMStrategy &strategy);
+void coopSplit(bool isA, int &splitR, int &splitC, int r, int c, int mnFull, CoopSplit &stype, const MatrixAddressing &atype, const GEMMStrategy &strategy);
 
 CoopSplit naturalSplitA(MatrixLayout layout);
 CoopSplit naturalSplitB(MatrixLayout layout);
