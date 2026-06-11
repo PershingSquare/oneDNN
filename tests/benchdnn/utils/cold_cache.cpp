@@ -62,7 +62,16 @@ cold_cache_t::cold_cache_t(
 
     static size_t gpu_cache_capacity = 0;
     SAFE_V(get_gpu_cache_size(gpu_cache_capacity));
-    static const size_t gpu_cache_size_upper_bound = gpu_cache_capacity * 2;
+    // 2x is too small to evict a large GPU L2 when one cold-arg set is itself a
+    // big fraction of L2: too few buffers rotate, L2 stays warm, and measured
+    // BW exceeds the DRAM peak. Larger pool forces DRAM reads. Env-overridable.
+    static const size_t gpu_cold_pool_mult = []() {
+        const char *e = getenv("BENCHDNN_GPU_COLD_POOL_MULT");
+        size_t m = e ? (size_t)strtoull(e, nullptr, 10) : 16;
+        return m < 2 ? size_t(2) : m;
+    }();
+    static const size_t gpu_cache_size_upper_bound
+            = gpu_cache_capacity * gpu_cold_pool_mult;
 
     const auto cache_capacity
             = is_gpu() ? gpu_cache_capacity : cpu_cache_capacity;
