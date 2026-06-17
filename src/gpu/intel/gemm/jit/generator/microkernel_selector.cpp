@@ -46,6 +46,58 @@ namespace microkernel {
 
 using namespace ngen;
 
+static inline void adjustMicrokernelWalkOrder(const HWInformation &hwInfo,
+        const SizeParams &sizes, GEMMStrategy &strategy) {
+    int wg_tile_m = strategy.wg[LoopM] * strategy.unroll[LoopM];
+    int wg_tile_n = strategy.wg[LoopN] * strategy.unroll[LoopN];
+    if (wg_tile_m <= 0 || wg_tile_n <= 0) return;
+
+    int64_t m_tiles = int64_t(div_up(sizes.m, wg_tile_m));
+    int64_t n_tiles = int64_t(div_up(sizes.n, wg_tile_n));
+    int64_t thread_per_tg = strategy.wg[LoopM] * strategy.wg[LoopN];
+    if (!strategy.kParallelVariable)
+        thread_per_tg *= std::max(strategy.wg[LoopK], 1);
+    if (thread_per_tg <= 0) return;
+
+    auto product = npack::decodeHWIPVersion(hwInfo.gmdid);
+    auto hw = getCore(product.family);
+    int64_t thread_gpu
+            = int64_t(hwInfo.euCount) * threadsPerEU(hw, strategy);
+    int64_t tiles_gpu = thread_gpu / thread_per_tg;
+
+    bool use_linear = (m_tiles * n_tiles <= tiles_gpu);
+    bool use_linear_m = (m_tiles * m_tiles <= 2 * tiles_gpu);
+    bool use_linear_n = (n_tiles * n_tiles <= 2 * tiles_gpu);
+
+    if (strategy.fused)
+        if (strategy.wg[LoopM] % 2 || strategy.wg[LoopN] % 2)
+            use_linear_m = use_linear_n = false;
+
+    if (use_linear) {
+        if (strategy.kParallelVariable)
+            strategy.cWalkOrder = WalkOrder::SimpleLinear;
+        else if (strategy.kParallel
+                && (strategy.fuseBeta || strategy.fusePostOps)) {
+            strategy.persistent = false;
+            strategy.cWalkOrder = WalkOrder::SimpleLinear;
+        } else {
+            strategy.persistent = false;
+            strategy.cWalkOrder = WalkOrder::HW2D;
+            strategy.blocking[LoopM] = 16777216;
+            strategy.blocking[LoopN] = 16777216;
+        }
+    } else if (use_linear_m || use_linear_n) {
+        if (use_linear_n && !use_linear_m) {
+            strategy.loopOrder[0] = LoopN;
+            strategy.loopOrder[1] = LoopM;
+        } else if (use_linear_m && !use_linear_n) {
+            strategy.loopOrder[0] = LoopM;
+            strategy.loopOrder[1] = LoopN;
+        }
+        strategy.cWalkOrder = WalkOrder::SimpleLinear;
+    }
+}
+
 static inline bool getStrategyByHeuristics(HW hw, GEMMStrategy &strategy, bool localA, bool localB,
                                            GEMMProblem &problem, HWInformation hwInfo, SizeParams sizes,
                                            const std::vector<StrategyRequirement> &reqs);
@@ -321,7 +373,7 @@ Package selectGEMM(const GEMMOptions &options, HWInformation hwInfo, SizeParams 
 
         /* Disable strategies not related to microkernels */
         strategy.kParallel = strategy.kParallelVariable = strategy.persistent = false;
-        strategy.cWalkOrder = WalkOrder::HW2D;
+        adjustMicrokernelWalkOrder(hwInfo, sizes, strategy);
 
         /* Disable k-parallelization if the protocol does not allow it */
         if (!kParallelLocal) {
