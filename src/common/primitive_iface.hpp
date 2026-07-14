@@ -66,6 +66,9 @@ struct dnnl_primitive : public dnnl::impl::c_compatible {
             dnnl::impl::cache_blob_t cache_blob) const;
     dnnl::impl::status_t execute(dnnl::impl::exec_ctx_t &ctx) const;
 
+    dnnl::impl::status_t prepare_ctx(dnnl::impl::exec_ctx_t &ctx) const;
+    dnnl::impl::status_t execute_fast(dnnl::impl::exec_ctx_t &ctx) const;
+
     void retain() { counter_++; }
 
     void release() {

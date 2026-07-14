@@ -23,6 +23,23 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+// Build a prefix sum over the active M tiles for each expert.
+kernel void grouped_compute_tile_starts(
+        const global int *src_offsets, global int *tile_starts) {
+    if (get_global_id(0) != 0) return;
+
+    int sum = 0;
+    int prev = 0;
+    for (int i = 0; i < NUM_GROUPS; i++) {
+        tile_starts[i] = sum;
+        int curr = src_offsets[i];
+        int tokens = curr - prev;
+        sum += (tokens + WG_TILE_N - 1) / WG_TILE_N;
+        prev = curr;
+    }
+    tile_starts[NUM_GROUPS] = sum; // total active tiles
+}
+
 #if WITH_BIAS
 #define bias_br ugemm_grouped_sg_tile_m
 #define bias_bc 1
@@ -174,7 +191,7 @@ void load_src_attr_scales(src_attr_scales_tile_type *tile,
 #else
     src_attr_scales_in_tile_type src_attr_scales_in_tile;
     tile_load(&src_attr_scales_in_tile, ptr, m, 1, ldsrcq, sg_j0, 0);
-    tile_convert(src_attr_scales_in_tile, (*tile), CONVERT_FLOAT_T);
+    tile_convert(src_attr_scales_in_tile, (*tile), SRC_SCALES_TO_REF);
 #endif
 }
 #endif
@@ -206,7 +223,7 @@ void load_wei_attr_scales(wei_attr_scales_tile_type *tile,
 #else
     wei_attr_scales_in_tile_type wei_attr_scales_in_tile;
     tile_load(&wei_attr_scales_in_tile, ptr, n, 1, ldweiq, sg_i0, 0);
-    tile_convert(wei_attr_scales_in_tile, (*tile), CONVERT_FLOAT_T);
+    tile_convert(wei_attr_scales_in_tile, (*tile), WEI_SCALES_TO_REF);
 #endif
 }
 #endif
@@ -222,7 +239,9 @@ grouped_micro_gemm(const global SRC_DATA_T *src, long ldsrc,
         const global SRC_ZP_DATA_T *src_attr_zp, const long ldsrcq,
         const global WEI_SCALES_DATA_T *wei_attr_scales,
         const global WEI_ZP_DATA_T *wei_attr_zp, const long ldweiq,
-        const long n, const long k, const global BIA_DATA_T *bias) {
+        const long n, const long k,
+        const global BIA_DATA_T *bias OPTIONAL(
+                WITH_ACTIVE_TILE_LIST, const global int *tile_starts)) {
 #if WITH_SLM
     local char slm[MAX(ugemm_grouped_slm_size, slm_sparse_total_size)];
 #else
@@ -245,7 +264,26 @@ grouped_micro_gemm(const global SRC_DATA_T *src, long ldsrc,
     off_t m;
     off_t src_offset;
 
-#if WITH_SPARSE_GROUPS
+#if WITH_ACTIVE_TILE_LIST
+    int total_tiles = tile_starts[NUM_GROUPS];
+    off_t tile_idx = get_group_id(2);
+    if (tile_idx >= total_tiles) return;
+
+    int lo = 0, hi = NUM_GROUPS;
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) >> 1;
+        if (tile_starts[mid] <= tile_idx)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    batch = lo;
+    int tile_within_expert = (int)tile_idx - tile_starts[batch];
+    int prev = (batch == 0) ? 0 : src_offsets[batch - 1];
+    src_offset = prev;
+    m = src_offsets[batch] - prev;
+    wg_j0 = (off_t)tile_within_expert * ugemm_grouped_wg_tile_n;
+#elif WITH_SPARSE_GROUPS
     off_t flat_token = get_group_id(2);
     int2 src_range;
     find_sparse_batch(&batch, &src_range, src_offsets, flat_token, slm);

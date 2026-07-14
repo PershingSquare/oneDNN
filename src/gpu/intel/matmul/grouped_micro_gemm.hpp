@@ -71,6 +71,8 @@ struct grouped_micro_gemm_t : public primitive_t {
         status_t init_microkernels(impl::engine_t *engine);
 
         bool is_gemv_ = false;
+        bool k_parallel_local_ = false;
+        bool use_active_tile_list_ = false;
         int sg_size_ = 0;
         int strategyGRFs_ = 0;
         dim_t ngroups_ = 0;
@@ -84,10 +86,47 @@ struct grouped_micro_gemm_t : public primitive_t {
     status_t init(impl::engine_t *engine) override;
 
     status_t execute(const exec_ctx_t &ctx) const override;
+    status_t execute_fast(const exec_ctx_t &ctx) const override {
+        return execute_fast_cached(ctx);
+    }
 
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
     compute::kernel_t kernel_;
+    compute::kernel_t precompute_kernel_;
+
+    struct dispatch_t {
+        compute::kernel_arg_list_t args;
+        compute::range_t lws = compute::range_t::one(3);
+        compute::range_t gws = compute::range_t::one(3);
+        size_t wg_tile_n = 0;
+        dim_t m_all = 0;
+        std::unique_ptr<memory_storage_t> tile_starts;
+    };
+
+    struct fast_cache_t {
+        bool populated = false;
+        dispatch_t dispatch;
+
+#ifndef __SYCL_DEVICE_ONLY__
+        void *l0_kernel = nullptr;
+        void *l0_cmdlist = nullptr;
+        struct l0_ptr_arg_t {
+            int idx;
+            void *ptr;
+        };
+        std::vector<l0_ptr_arg_t> l0_ptr_args;
+        bool l0_ready = false;
+#endif
+    };
+    mutable fast_cache_t fast_cache_;
+
+    status_t prepare_dispatch(
+            const exec_ctx_t &ctx, dispatch_t &dispatch) const;
+    compute::range_t resolve_dispatch_range(
+            const exec_ctx_t &ctx, const dispatch_t &dispatch) const;
+    status_t populate_fast_cache(const exec_ctx_t &ctx) const;
+    status_t execute_fast_cached(const exec_ctx_t &ctx) const;
 };
 
 } // namespace matmul

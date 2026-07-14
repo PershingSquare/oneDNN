@@ -367,6 +367,11 @@ const primitive_desc_iface_t *dnnl_primitive::pd() const {
 }
 
 status_t dnnl_primitive::execute(exec_ctx_t &ctx) const {
+    CHECK(prepare_ctx(ctx));
+    return primitive_->execute(ctx);
+}
+
+status_t dnnl_primitive::prepare_ctx(exec_ctx_t &ctx) const {
     const memory_storage_t *mem_storage = nullptr;
     if (primitive_->pd()->attr()->scratchpad_mode_ == scratchpad_mode::user) {
         memory_t *scratchpad_memory = ctx.output(DNNL_ARG_SCRATCHPAD);
@@ -389,9 +394,11 @@ status_t dnnl_primitive::execute(exec_ctx_t &ctx) const {
                     mem_storage, mapped_mem_storage_ptr);
     ctx.set_scratchpad_grantor(scratchpad_grantor);
     ctx.set_resource_mapper(&resource_mapper_);
+    return success;
+}
 
-    auto status = primitive_->execute(ctx);
-    return status;
+status_t dnnl_primitive::execute_fast(exec_ctx_t &ctx) const {
+    return primitive_->execute_fast(ctx);
 }
 
 status_t dnnl_primitive::get_cache_blob_size(size_t *size) const {

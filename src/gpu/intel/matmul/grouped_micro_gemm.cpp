@@ -18,12 +18,22 @@
 
 #if DNNL_EXPERIMENTAL_GROUPED_MEMORY
 
+#include "common/memory_tracking.hpp"
 #include "gemmstone/microkernel/shim.hpp"
 #include "gemmstone/microkernel_selector.hpp"
 #include "gemmstone/strategy_parser.hpp"
 #include "gpu/intel/compute/ukernels.hpp"
 #include "gpu/intel/compute/utils.hpp"
 #include "gpu/intel/gemm/jit/gen_kernel.hpp"
+#include "gpu/intel/sycl/interop_kernel.hpp"
+#include "gpu/intel/sycl/stream.hpp"
+#include "xpu/sycl/usm_memory_storage.hpp"
+#include "xpu/ze/utils.hpp"
+
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#include <variant>
 
 #define VCHECK_MATMUL(cond, msg, ...) \
     VCONDCHECK(primitive, create, check, matmul, (cond), \
@@ -88,7 +98,16 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
     opts.scaleB = src_quant_.with_scale() && src_group_sizes_[1] < K();
     opts.offsetB = src_quant_.with_zp();
     opts.slmPtr = true;
-    opts.kParallelLocal = is_gemv_;
+    const bool xe2_w4a8 = dev_info->gpu_arch() == compute::gpu_arch_t::xe2
+            && problem.Ta_ext.isInt4()
+            && utils::one_of(problem.Tb_ext, Type::u8, Type::s8)
+            && ngroups_ == 128 && wei_group_sizes_[1] == 128;
+    const bool w13_sparse_decode
+            = xe2_w4a8 && N() == 768 && K() == 2944 && M() < ngroups_ * 8;
+    const bool w2_large_prefill
+            = xe2_w4a8 && N() == 2880 && K() == 384 && M() >= ngroups_ * 64;
+    opts.kParallelLocal = is_gemv_ || w13_sparse_decode || w2_large_prefill;
+    k_parallel_local_ = opts.kParallelLocal;
 
     if (opts.scaleA) {
         data_type_t wei_scale_dt = wei_quant_.scale_dt();
@@ -166,32 +185,43 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
 
     SizeParams sizes;
     sizes.m = static_cast<uint16_t>(N());
-    sizes.n = is_gemv_ ? 1 : 32;
+    sizes.n = is_gemv_ ? (xe2_w4a8 ? 4 : 1) : 32;
     sizes.k = static_cast<uint16_t>(K());
 
     auto strat_override = [&](gemmstone::GEMMStrategy &strat) {
-        std::string newStrat;
         using namespace gemmstone;
         strat.dpasw |= strat.fused;
-        newStrat = gpu_utils::dev_getenv("GRPGEMM_USTRATEGY", newStrat);
-        if (!newStrat.empty()) {
-            // Example: 16 16 1 0 aT32 aM32 aB wg 2x4 sys
-            printf("GRPGEMM_USTRATEGY: %s\n", newStrat.c_str());
+
+        auto set_strategy = [&](int unroll_m, int unroll_n, const char *body) {
             auto product = ngen::npack::decodeHWIPVersion(hw_info.gmdid);
             auto hw = getCore(product.family);
             auto stepping = hw_info.gmdid & 0xFF;
             strat = GEMMStrategy(hw, stepping);
-            std::stringstream ss(newStrat);
-            ss >> strat.unroll[0];
-            ss >> strat.unroll[1];
-            float a, b;
-            ss >> a;
-            ss >> b;
-            Scalar alpha((int)a), beta((int)b);
-            std::string strategyString;
-            std::getline(ss >> std::ws, strategyString);
-            parseStrategy(strategyString, hw, problem, strat);
+            strat.unroll[0] = unroll_m;
+            strat.unroll[1] = unroll_n;
+            parseStrategy(body, hw, problem, strat);
             adjustStrategy(hw, problem, strat);
+        };
+
+        if (xe2_w4a8 && is_gemv_) {
+            set_strategy(32, 32,
+                    "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 2x1 "
+                    "sys xaf k1 grf256 vav di sr pk32 np");
+        } else if (xe2_w4a8 && !use_active_tile_list_ && N() == 768
+                && K() == 2944 && M() <= 2048) {
+            set_strategy(32, 16,
+                    "aT64/0{cc}+M64,64@128{cc} "
+                    "aM16/0{cc}+M16,16@32{cc} rb wg 2x1 sys xaf k1 "
+                    "grf256 vav di sr pk16 np");
+        } else if (xe2_w4a8 && use_active_tile_list_ && N() == 768
+                && K() == 2944) {
+            set_strategy(32, 32,
+                    "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 8x1 "
+                    "sys xaf k1 grf256 vav di sr np");
+        } else if (w2_large_prefill) {
+            set_strategy(32, 32,
+                    "aT64/0{cc} aM64/0{cc}+M64,64@128{cc} rB wg 1x1 "
+                    "sys xaf k1 grf256 vav di sr np");
         }
         strategyGRFs_ = strat.GRFs;
     };
@@ -229,6 +259,14 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(impl::engine_t *engine) {
                 if (problem.Ta_ext.bits() <= 8) min_wg_n = 2;
                 break;
             case compute::gpu_arch_t::xe_hpc: max_n_unroll = 32; break;
+            case compute::gpu_arch_t::xe2: {
+                m_unroll = 32;
+                n_unroll = 32;
+                max_n_unroll = 32;
+                max_wg_n = 2;
+                min_wg_n = 1;
+                break;
+            }
             default:
                 m_unroll = sg_size_ / problem.Ta_ext;
                 max_n_unroll
@@ -313,7 +351,9 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
             (int)src_grouped.group_count, (int)dst_grouped.group_count);
 
     ngroups_ = src_grouped.group_count;
-    is_gemv_ = M() < ngroups_;
+    const bool is_w4a8
+            = utils::one_of(wei_dt, s4, u4) && utils::one_of(src_dt, u8, s8);
+    is_gemv_ = M() < ngroups_ + (is_w4a8 ? 1 : 0);
 
     // only supported dt for now
     VDISPATCH_MATMUL(utils::one_of(src_dt, f32, f16, bf16, u8, s8, s4, u4,
@@ -442,6 +482,13 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     }
     sg_size_ = dev_info->min_subgroup_size();
 
+    const bool is_gpt_oss_tp8_projection = ngroups_ == 128
+            && wei_group_sizes_[1] == 128
+            && ((N() == 768 && K() == 2944) || (N() == 2880 && K() == 384));
+    use_active_tile_list_ = is_w4a8
+            && dev_info->gpu_arch() == compute::gpu_arch_t::xe2
+            && is_gpt_oss_tp8_projection && M() >= ngroups_ * 64;
+
     CHECK(init_microkernels(engine));
 
     src_quant_.define_macros(kernel_ctx_, "SRC");
@@ -488,22 +535,36 @@ status_t grouped_micro_gemm_t::pd_t::init(impl::engine_t *engine) {
     auto bia_dt = weights_md(1)->data_type;
     def_data_type(kernel_ctx_, bia_dt, "BIA");
     kernel_ctx_.define_int("WITH_BIAS", with_bias());
-    kernel_ctx_.define_int("K_PARALLEL_LOCAL", is_gemv_);
+    kernel_ctx_.define_int("K_PARALLEL_LOCAL", k_parallel_local_);
     kernel_ctx_.define_int("WITH_SPARSE_GROUPS", is_gemv_);
+    kernel_ctx_.define_int("WITH_ACTIVE_TILE_LIST", use_active_tile_list_);
     kernel_ctx_.define_int("WITH_SLM", gemm_.getSetting("slm_size") > 0);
     kernel_ctx_.define_int("NUM_GROUPS", ngroups_);
+    kernel_ctx_.define_int("WG_TILE_N", gemm_.getSetting("wg_tile_n"));
     kernel_ctx_.add_option("-cl-std=CL3.0");
+
+    if (use_active_tile_list_) {
+        auto scratchpad = scratchpad_registry().registrar();
+        scratchpad.book(memory_tracking::names::key_matmul_pack_space,
+                ngroups_ + 1, sizeof(int32_t), OCL_BUFFER_ALIGNMENT);
+    }
 
     return status::success;
 }
 
 status_t grouped_micro_gemm_t::init(impl::engine_t *engine) {
-    return create_kernel(
-            engine, &kernel_, "grouped_micro_gemm", pd()->kernel_ctx_);
+    std::vector<compute::kernel_t> kernels;
+    std::vector<const char *> kernel_names = {"grouped_micro_gemm"};
+    if (pd()->use_active_tile_list_)
+        kernel_names.push_back("grouped_compute_tile_starts");
+    CHECK(create_kernels(engine, &kernels, kernel_names, pd()->kernel_ctx_));
+    kernel_ = kernels[0];
+    if (pd()->use_active_tile_list_) precompute_kernel_ = kernels[1];
+    return status::success;
 }
 
-status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
-    // buffer 0: values, buffer 1: offsets
+status_t grouped_micro_gemm_t::prepare_dispatch(
+        const exec_ctx_t &ctx, dispatch_t &dispatch) const {
     const auto &src_data = CTX_IN_STORAGE(DNNL_ARG_SRC, 0);
     const auto &src_offsets = CTX_IN_STORAGE(DNNL_ARG_SRC, 1);
     const auto &wei_data = CTX_IN_STORAGE(DNNL_ARG_WEIGHTS);
@@ -543,7 +604,7 @@ status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
         ldweiq = static_cast<int>(
                 wei_quant_md->format_desc.blocking.strides[1]);
     }
-    dim_t m_all = dst_md->dims[dst_md->ndims - 2];
+    dispatch.m_all = dst_md->dims[dst_md->ndims - 2];
     dim_t n = dst_md->dims[dst_md->ndims - 1];
     dim_t k = src_md->dims[src_md->ndims - 1];
 
@@ -556,53 +617,232 @@ status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
                     static_cast<int64_t>(wei_strides_[wei_md->ndims - 1]),
                     static_cast<int64_t>(wei_strides_[wei_md->ndims - 0])};
 
-    compute::kernel_arg_list_t arg_list;
-    arg_list.append(src_data);
-    arg_list.append(ldsrc);
-    arg_list.append(wei_data);
-    arg_list.append(wei_strides);
-    arg_list.append(dst_data);
-    arg_list.append(lddst);
-    arg_list.append(src_offsets);
-    arg_list.append(dst_offsets);
-    arg_list.append(src_scales);
-    arg_list.append(src_zero_points);
-    arg_list.append(ldsrcq);
-    arg_list.append(wei_scales);
-    arg_list.append(wei_zero_points);
-    arg_list.append(ldweiq);
-    arg_list.append(n);
-    arg_list.append(k);
+    dispatch.args.append(src_data);
+    dispatch.args.append(ldsrc);
+    dispatch.args.append(wei_data);
+    dispatch.args.append(wei_strides);
+    dispatch.args.append(dst_data);
+    dispatch.args.append(lddst);
+    dispatch.args.append(src_offsets);
+    dispatch.args.append(dst_offsets);
+    dispatch.args.append(src_scales);
+    dispatch.args.append(src_zero_points);
+    dispatch.args.append(ldsrcq);
+    dispatch.args.append(wei_scales);
+    dispatch.args.append(wei_zero_points);
+    dispatch.args.append(ldweiq);
+    dispatch.args.append(n);
+    dispatch.args.append(k);
+    dispatch.args.append(bias_data);
 
-    arg_list.append(bias_data);
+    if (pd()->use_active_tile_list_) {
+        dispatch.tile_starts = ctx.get_scratchpad_grantor().get_memory_storage(
+                memory_tracking::names::key_matmul_pack_space);
+
+        compute::kernel_arg_list_t pre_args;
+        pre_args.append(src_offsets);
+        pre_args.append(*dispatch.tile_starts);
+
+        compute::range_t pre_lws = compute::range_t {1, 1, 1};
+        compute::range_t pre_gws
+                = compute::range_t {(size_t)pd()->sg_size_, 1, 1};
+        CHECK(parallel_for(ctx, compute::nd_range_t(pre_gws, pre_lws),
+                precompute_kernel_, pre_args));
+        dispatch.args.append(*dispatch.tile_starts);
+    }
 
     size_t sg_per_wg_m = pd()->gemm_.getSetting("sg_per_wg_m");
     size_t sg_per_wg_n = pd()->gemm_.getSetting("sg_per_wg_n");
     size_t sg_per_wg_k = pd()->gemm_.getSetting("sg_per_wg_k");
     size_t wg_tile_m = pd()->gemm_.getSetting("wg_tile_m");
-    size_t wg_tile_n = pd()->gemm_.getSetting("wg_tile_n");
+    dispatch.wg_tile_n = pd()->gemm_.getSetting("wg_tile_n");
 
-    // Use total_tokens as upper bound for M dimension
-    compute::range_t lws = compute::range_t::one(3);
-    lws[0] *= pd()->sg_size_;
+    dispatch.lws[0] *= pd()->sg_size_ * sg_per_wg_m;
+    dispatch.lws[1] *= sg_per_wg_n;
+    dispatch.lws[2] *= sg_per_wg_k;
 
-    lws[0] *= sg_per_wg_m;
-    lws[1] *= sg_per_wg_n;
-    lws[2] *= sg_per_wg_k;
+    dispatch.gws = dispatch.lws;
+    dispatch.gws[0] *= utils::div_up(n, wg_tile_m);
+    if (pd()->is_gemv_) {
+        dispatch.gws[2] *= dispatch.m_all;
+    } else if (pd()->use_active_tile_list_) {
+        const dim_t total_tiles_upper
+                = utils::div_up(dispatch.m_all, dispatch.wg_tile_n)
+                + pd()->ngroups_;
+        dispatch.gws[2] *= total_tiles_upper;
+    } else {
+        dispatch.gws[2] *= pd()->ngroups_;
+    }
+    return status::success;
+}
 
-    dim_t m_dispatch = m_all;
-    const int32_t *max_var_dim
+compute::range_t grouped_micro_gemm_t::resolve_dispatch_range(
+        const exec_ctx_t &ctx, const dispatch_t &dispatch) const {
+    compute::range_t gws = dispatch.gws;
+    if (pd()->is_gemv_ || pd()->use_active_tile_list_) return gws;
+
+    dim_t m_dispatch = dispatch.m_all;
+    const int32_t *max_group_size
             = CTX_IN_MEM(const int32_t *, DNNL_ARG_HINT_MAX_GROUP_SIZE);
-    if (max_var_dim && *max_var_dim > 0 && *max_var_dim <= m_all)
-        m_dispatch = *max_var_dim;
+    if (max_group_size && *max_group_size > 0
+            && *max_group_size <= dispatch.m_all)
+        m_dispatch = *max_group_size;
+    gws[1] *= utils::div_up(m_dispatch, dispatch.wg_tile_n);
+    return gws;
+}
 
-    compute::range_t gws = lws;
-    // Swap wg_tile_[mn]_ for col-major vs row-major representations
-    gws[0] *= utils::div_up(n, wg_tile_m);
-    gws[1] *= utils::div_up(m_dispatch, wg_tile_n);
-    gws[2] *= pd()->is_gemv_ ? m_all : pd()->ngroups_;
+status_t grouped_micro_gemm_t::execute(const exec_ctx_t &ctx) const {
+    dispatch_t dispatch;
+    CHECK(prepare_dispatch(ctx, dispatch));
+    compute::range_t gws = resolve_dispatch_range(ctx, dispatch);
 
-    return parallel_for(ctx, compute::nd_range_t(gws, lws), kernel_, arg_list);
+    return parallel_for(ctx, compute::nd_range_t(gws, dispatch.lws), kernel_,
+            dispatch.args);
+}
+
+#ifndef __SYCL_DEVICE_ONLY__
+static size_t l0_scalar_arg_size(compute::scalar_type_t type) {
+    using scalar_t = compute::scalar_type_t;
+    switch (type) {
+        case scalar_t::_char:
+        case scalar_t::_uchar: return 1;
+        case scalar_t::_half:
+        case scalar_t::_bfloat16:
+        case scalar_t::_short:
+        case scalar_t::_ushort: return 2;
+        case scalar_t::_float:
+        case scalar_t::_int:
+        case scalar_t::_uint: return 4;
+        case scalar_t::_double:
+        case scalar_t::_long:
+        case scalar_t::_ulong: return 8;
+        case scalar_t::_int64x2_t: return 16;
+        case scalar_t::_int64x3_t: return 24;
+        case scalar_t::_int64x4_t: return 32;
+        case scalar_t::_int64x5_t: return 40;
+        case scalar_t::_int64x6_t: return 48;
+        default: return 0;
+    }
+}
+
+static void *l0_usm_pointer(const memory_storage_t &storage) {
+    if (!storage) return nullptr;
+    return utils::downcast<const xpu::sycl::usm_memory_storage_t *>(&storage)
+            ->usm_ptr();
+}
+#endif
+
+status_t grouped_micro_gemm_t::populate_fast_cache(
+        const exec_ctx_t &ctx) const {
+    if (pd()->use_active_tile_list_) return status::unimplemented;
+
+    auto &fc = fast_cache_;
+    CHECK(prepare_dispatch(ctx, fc.dispatch));
+
+#ifndef __SYCL_DEVICE_ONLY__
+    auto *stream = dynamic_cast<intel::sycl::stream_t *>(ctx.stream());
+    const auto *kernel_impl
+            = dynamic_cast<const sycl::interop_kernel_t *>(kernel_.impl());
+    if (stream && kernel_impl) {
+        auto ze_kernel
+                = ::sycl::get_native<::sycl::backend::ext_oneapi_level_zero>(
+                        kernel_impl->sycl_kernel());
+        auto native_queue
+                = ::sycl::get_native<::sycl::backend::ext_oneapi_level_zero>(
+                        stream->queue());
+        auto *command_list
+                = std::get_if<ze_command_list_handle_t>(&native_queue);
+
+        status_t l0_status = status::success;
+        if (!ze_kernel || !command_list) {
+            l0_status = status::unimplemented;
+        } else {
+            fc.l0_kernel = ze_kernel;
+            fc.l0_cmdlist = *command_list;
+            for (int i = 0; i < fc.dispatch.args.nargs(); ++i) {
+                const auto &arg = fc.dispatch.args.get(i);
+                if (arg.is_global()) {
+                    const auto *memory = static_cast<const memory_storage_t *>(
+                            arg.value());
+                    void *pointer = l0_usm_pointer(*memory);
+                    fc.l0_ptr_args.push_back({i, pointer});
+                    l0_status = xpu::ze::zeKernelSetArgumentValue(
+                            ze_kernel, i, sizeof(pointer), &pointer);
+                } else if (arg.is_local()) {
+                    l0_status = xpu::ze::zeKernelSetArgumentValue(
+                            ze_kernel, i, arg.size(), nullptr);
+                } else {
+                    const size_t size = l0_scalar_arg_size(arg.scalar_type());
+                    if (size == 0) {
+                        l0_status = status::unimplemented;
+                    } else {
+                        l0_status = xpu::ze::zeKernelSetArgumentValue(
+                                ze_kernel, i, size, arg.value());
+                    }
+                }
+                if (l0_status != status::success) break;
+            }
+            if (l0_status == status::success) {
+                l0_status = xpu::ze::zeKernelSetGroupSize(ze_kernel,
+                        static_cast<uint32_t>(fc.dispatch.lws[0]),
+                        static_cast<uint32_t>(fc.dispatch.lws[1]),
+                        static_cast<uint32_t>(fc.dispatch.lws[2]));
+            }
+        }
+        fc.l0_ready = l0_status == status::success;
+    }
+#endif
+
+    fc.populated = true;
+    return status::success;
+}
+
+status_t grouped_micro_gemm_t::execute_fast_cached(
+        const exec_ctx_t &ctx) const {
+    auto &fc = fast_cache_;
+    if (!fc.populated) {
+        if (populate_fast_cache(ctx) != status::success) return execute(ctx);
+    }
+
+    const auto &dispatch = fc.dispatch;
+    compute::range_t gws = resolve_dispatch_range(ctx, dispatch);
+
+#ifndef __SYCL_DEVICE_ONLY__
+    if (fc.l0_ready) {
+        for (auto &entry : fc.l0_ptr_args) {
+            const auto &arg = dispatch.args.get(entry.idx);
+            const auto *memory
+                    = static_cast<const memory_storage_t *>(arg.value());
+            void *pointer = l0_usm_pointer(*memory);
+            if (pointer != entry.ptr) {
+                status_t l0_status = xpu::ze::zeKernelSetArgumentValue(
+                        static_cast<ze_kernel_handle_t>(fc.l0_kernel),
+                        entry.idx, sizeof(pointer), &pointer);
+                if (l0_status != status::success) {
+                    fc.l0_ready = false;
+                    break;
+                }
+                entry.ptr = pointer;
+            }
+        }
+
+        if (fc.l0_ready) {
+            ze_group_count_t group_count {
+                    static_cast<uint32_t>(gws[0] / dispatch.lws[0]),
+                    static_cast<uint32_t>(gws[1] / dispatch.lws[1]),
+                    static_cast<uint32_t>(gws[2] / dispatch.lws[2])};
+            status_t l0_status = xpu::ze::zeCommandListAppendLaunchKernel(
+                    static_cast<ze_command_list_handle_t>(fc.l0_cmdlist),
+                    static_cast<ze_kernel_handle_t>(fc.l0_kernel), &group_count,
+                    nullptr, 0, nullptr);
+            if (l0_status == status::success) return l0_status;
+            fc.l0_ready = false;
+        }
+    }
+#endif
+
+    return parallel_for(ctx, compute::nd_range_t(gws, dispatch.lws), kernel_,
+            dispatch.args);
 }
 
 } // namespace matmul

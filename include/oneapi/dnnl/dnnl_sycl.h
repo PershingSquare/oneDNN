@@ -184,6 +184,37 @@ dnnl_status_t DNNL_API dnnl_sycl_interop_primitive_execute(
         const_dnnl_primitive_t primitive, dnnl_stream_t stream, int nargs,
         const dnnl_exec_arg_t *args, const void *deps, void *return_event);
 
+/// Opaque cached-execution handle.
+struct dnnl_sycl_interop_execute_handle;
+typedef struct dnnl_sycl_interop_execute_handle
+        *dnnl_sycl_interop_execute_handle_t;
+
+/// Creates a handle for repeated execution with stable memory objects.
+///
+/// @param handle Output handle.
+/// @param primitive Primitive bound by this handle.
+/// @param stream Stream bound by this handle.
+/// @param nargs Number of arguments.
+/// @param args Argument array. The handle retains the memory objects.
+dnnl_status_t DNNL_API dnnl_sycl_interop_execute_handle_create(
+        dnnl_sycl_interop_execute_handle_t *handle,
+        const_dnnl_primitive_t primitive, dnnl_stream_t stream, int nargs,
+        const dnnl_exec_arg_t *args);
+
+/// Destroys an execute handle.
+dnnl_status_t DNNL_API dnnl_sycl_interop_execute_handle_destroy(
+        dnnl_sycl_interop_execute_handle_t handle);
+
+/// Executes a primitive through a cached handle. The stream must outlive the
+/// handle. Bound memory data handles may change between calls.
+///
+/// @param handle Cached execute handle.
+/// @param deps Optional pointer to std::vector<sycl::event> dependencies.
+/// @param return_event Optional output event.
+dnnl_status_t DNNL_API dnnl_sycl_interop_primitive_execute_fast(
+        dnnl_sycl_interop_execute_handle_t handle, const void *deps,
+        void *return_event);
+
 /// @} dnnl_api_sycl_interop
 
 /// @} dnnl_api_interop

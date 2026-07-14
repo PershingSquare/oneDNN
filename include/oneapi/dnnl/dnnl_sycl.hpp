@@ -331,6 +331,49 @@ inline sycl::event execute(const dnnl::primitive &aprimitive,
 
 } // namespace sycl_interop
 
+/// @cond DO_NOT_DOCUMENT_THIS
+template <>
+struct handle_traits<dnnl_sycl_interop_execute_handle_t> {
+    static dnnl_status_t destructor(dnnl_sycl_interop_execute_handle_t p) {
+        return dnnl_sycl_interop_execute_handle_destroy(p);
+    }
+};
+/// @endcond
+
+namespace sycl_interop {
+
+struct execute_handle : public handle<dnnl_sycl_interop_execute_handle_t> {
+    using handle<dnnl_sycl_interop_execute_handle_t>::handle;
+
+    execute_handle() = default;
+
+    execute_handle(const dnnl::primitive &aprimitive, const stream &astream,
+            const std::unordered_map<int, memory> &args) {
+        std::vector<dnnl_exec_arg_t> c_args;
+        c_args.reserve(args.size());
+        for (const auto &a : args)
+            c_args.push_back({a.first, a.second.get()});
+
+        dnnl_sycl_interop_execute_handle_t h = nullptr;
+        error::wrap_c_api(
+                dnnl_sycl_interop_execute_handle_create(&h, aprimitive.get(),
+                        astream.get(), (int)c_args.size(), c_args.data()),
+                "could not create a sycl_interop execute handle");
+        reset(h);
+    }
+};
+
+inline sycl::event execute_fast(
+        execute_handle &handle, const std::vector<sycl::event> &deps = {}) {
+    sycl::event return_event;
+    error::wrap_c_api(dnnl_sycl_interop_primitive_execute_fast(
+                              handle.get(), &deps, &return_event),
+            "could not execute a primitive via fast path");
+    return return_event;
+}
+
+} // namespace sycl_interop
+
 /// @} dnnl_api_sycl_interop
 
 /// @} dnnl_api_interop
